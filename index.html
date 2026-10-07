@@ -829,6 +829,9 @@ const state = {
   extras: {},         // "region_cat" -> статьи из дополнительных запросов
   _poolP: {},         // идут загрузки региона (защита от повторов)
   _extraP: {},        // идут дополнительные запросы
+  /* Кэш: чтобы не тратить лимит 100 запросов в день на каждый заход.
+     Новости хранятся в памяти телефона несколько часов. */
+  cache: store.get('newsCache', {}),
   date: null,         // выбранная дата {y,m,d}
   newsDate: null,     // дата, для которой загружены новости
   shown: 8
@@ -1152,6 +1155,27 @@ async function loadHistory(date) {
 /* ================= НОВОСТИ (GNews) ================= */
 function bucketKey(region, cat) { return region + '_' + cat; }
 
+/* ---------- КЭШ: экономим лимит 100 запросов в день ---------- */
+const CACHE_POOL_MS = 3 * 3600 * 1000;   /* пул региона живёт 3 часа */
+const CACHE_EXTRA_MS = 2 * 3600 * 1000;  /* доп. запросы — 2 часа */
+
+function cacheRead(kind, key) {
+  const rec = state.cache[kind + ':' + key];
+  if (!rec || !rec.items) return null;
+  if (Date.now() - rec.at > (kind === 'pool' ? CACHE_POOL_MS : CACHE_EXTRA_MS)) return null;
+  return rec.items;
+}
+function cacheWrite(kind, key, items) {
+  state.cache[kind + ':' + key] = { at: Date.now(), items: items };
+  /* не даём кэшу расти бесконечно */
+  const keys = Object.keys(state.cache);
+  if (keys.length > 40) {
+    const sorted = keys.map(k => ({ k: k, at: state.cache[k].at })).sort((a, b) => a.at - b.at);
+    sorted.slice(0, sorted.length - 40).forEach(x => delete state.cache[x.k]);
+  }
+  store.set('newsCache', state.cache);
+}
+
 /* Диапазон дат для запроса: архив бесплатного тарифа — 30 дней */
 function newsRange() {
   const d = state.date;
@@ -1171,7 +1195,9 @@ function gnewsErrorMessage(status, body) {
     return 'Новости попросили слишком часто подряд — сервис просит немного подождать. Подождите минуту и нажмите «Показать» ещё раз.';
   }
   if (status === 403 || /rate|limit|quota|too many/.test(t)) {
-    return 'Сегодня уже много раз брали новости (лимит 100 в день). Приходите завтра — а пока посмотрите историю дня выше 😊';
+    return 'Новости на сегодня уже закончились: бесплатный ключ позволяет 100 запросов в день, ' +
+      'и они все использованы. Счётчик обновится в 4 часа ночи по московскому времени. ' +
+      'А пока можно спокойно почитать историю дня выше 🙂';
   }
   if (/api key|apikey|token|unauthorized|401/.test(t) || status === 401) {
     return 'Ключ новостей не подходит. Проверьте его в настройках (⋮) — возможно, скопирован не полностью.';
@@ -1260,6 +1286,13 @@ async function fetchRegionPool(region) {
   if (state.pools[region]) return state.pools[region];
   if (state._poolP[region]) return state._poolP[region];
 
+  /* сначала пробуем кэш — это не тратит лимит */
+  const cached = cacheRead('pool', region);
+  if (cached) {
+    state.pools[region] = cached;
+    return cached;
+  }
+
   const p = (async () => {
     if (region === 'samara') {
       const range = newsRange();
@@ -1281,6 +1314,7 @@ async function fetchRegionPool(region) {
         }
       }
       state.pools[region] = dedupe(mapArticles(all, region, null));
+      cacheWrite('pool', region, state.pools[region]);
       return state.pools[region];
     }
 
@@ -1291,6 +1325,7 @@ async function fetchRegionPool(region) {
     // топ-заголовки всегда свежие (по дате фильтруются только доп. запросы)
     const articles = await gnewsRequest(params, 'top-headlines');
     state.pools[region] = dedupe(mapArticles(articles, region, null));
+    cacheWrite('pool', region, state.pools[region]);
     return state.pools[region];
   })();
 
@@ -1316,6 +1351,14 @@ async function fetchBucket(region, cat) {
   const loadExtra = async () => {
     if (!queries.length) return;
     if (state.extras[key] !== undefined || state._extraP[key]) return;
+
+    /* кэш рубрики — тоже не тратит лимит */
+    const cached = cacheRead('extra', key);
+    if (cached) {
+      state.extras[key] = cached;
+      items = dedupe(items.concat(cached));
+      return;
+    }
     state._extraP[key] = true;
     const collected = [];
     try {
@@ -1338,6 +1381,7 @@ async function fetchBucket(region, cat) {
         }
       }
       state.extras[key] = dedupe(collected);
+      cacheWrite('extra', key, state.extras[key]);
       items = dedupe(items.concat(state.extras[key]));
     } finally {
       state._extraP[key] = false;
