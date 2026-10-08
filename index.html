@@ -652,8 +652,8 @@ body[data-theme="night"] .cat-chip.active { color: #141414; }
     Заметка по новостям для Наташи · история: Википедия · новости: Google News (GNews) с источниками — Лента.ру, РИА Новости, ТАСС и другие
   </footer>
 </main>
-
 <script>
+/* ==== app.js ==== */
 /* =========================================================
    Заметка по новостям для Наташи — приложение
    История: Википедия (без ключей)
@@ -1323,7 +1323,7 @@ async function fetchRegionPool(region) {
     params.set('max', '10');
     params.set('category', REGION_CATEGORY[region]);
     // топ-заголовки всегда свежие (по дате фильтруются только доп. запросы)
-    const articles = await gnewsRequest(params, 'top-headlines');
+    const articles = await newsWithFallback(region, params);
     state.pools[region] = dedupe(mapArticles(articles, region, null));
     cacheWrite('pool', region, state.pools[region]);
     return state.pools[region];
@@ -1685,6 +1685,67 @@ document.addEventListener('DOMContentLoaded', () => {
   initSettings();
 });
 
+
+/* ==== news_sources.js ==== */
+/* =============================================================
+   Запасной источник новостей — GDELT.
+
+   Зачем: сервис GNews из России доступен не у всех (у бабушки,
+   например, требуется VPN). GDELT тоже бесплатный, ключ не нужен,
+   и он отдаёт заголовки на русском языке.
+
+   GDELT не умеет делить новости по рубрикам, поэтому мы берём
+   общий список и распределяем заголовки по рубрикам сами —
+   тем же фильтром, что и для основного источника.
+   ============================================================= */
+
+const GDELT_QUERY = { ru: 'Россия', world: 'мир', samara: 'Самара' };
+
+/* Сначала пробуем основной источник (GNews). Если он недоступен —
+   нет сети или нужен VPN, — пробуем запасной (GDELT). */
+async function newsWithFallback(region, params) {
+  try {
+    return await gnewsRequest(params, 'top-headlines');
+  } catch (e) {
+    try {
+      return await fetchGdelt(region);
+    } catch (e2) {
+      throw new Error('Нет связи с новостями: похоже, на этой сети они недоступны. ' +
+        'История дня и сводка выше работают всегда 🙂');
+    }
+  }
+}
+
+/* дата GDELT приходит строкой вида 20261007T081500Z */
+function gdeltDate(s) {
+  if (!s || s.length < 15) return null;
+  const y = s.slice(0, 4), m = s.slice(4, 6), d = s.slice(6, 8);
+  const hh = s.slice(9, 11), mm = s.slice(11, 13), ss = s.slice(13, 15);
+  const dt = new Date(Date.UTC(+y, +m - 1, +d, +hh, +mm, +ss));
+  return isNaN(dt.getTime()) ? null : dt;
+}
+
+async function fetchGdelt(region) {
+  const q = GDELT_QUERY[region] || GDELT_QUERY.ru;
+  const url = 'https://api.gdeltproject.org/api/v2/doc/doc?query=' + encodeURIComponent(q) +
+    '&mode=artlist&format=json&maxrecords=40&sourcelang=russian&sort=datedesc';
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('GDELT HTTP ' + res.status);
+  const data = await res.json();
+  const articles = data.articles || [];
+  if (!articles.length) throw new Error('GDELT: пусто');
+
+  /* приводим к тому же виду, что и новости основного источника */
+  const items = articles.map(a => ({
+    title: a.title || '',
+    description: '',
+    url: a.url || '',
+    publishedAt: gdeltDate(a.seendate),
+    source: { name: a.domain || 'GDELT' }
+  }));
+  return dedupe(mapArticles(items, region, null));
+}
 </script>
 </body>
 </html>
